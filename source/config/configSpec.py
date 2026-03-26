@@ -380,6 +380,8 @@ schemaVersion = integer(min=0, default={latestSchemaVersion})
 		__many__ = string(default="")
 	[[trustedUnencryptedServers]]
 		__many__ = boolean(default=False)
+	[[trustedIdentityKeys]]
+		__many__ = string(default="")
 	[[ui]]
 		confirmDisconnectAsFollower = boolean(default=True)
 		muteOnLocalControl = boolean(default=False)

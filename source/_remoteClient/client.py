@@ -397,6 +397,7 @@ class RemoteClient:
 		)
 		self.leaderSession.e2eUnavailable.register(self.onE2EUnavailable)
 		self.leaderSession.e2ePeerUnsupported.register(self.onE2EPeerUnsupported)
+		self.leaderSession.e2eIdentityChanged.register(self.onE2EIdentityChanged)
 		transport.transportCertificateAuthenticationFailed.register(
 			self.onLeaderCertificateFailed,
 		)
@@ -451,6 +452,8 @@ class RemoteClient:
 			isDirectConnection=isDirectConnection,
 		)
 		self.followerSession.e2eUnavailable.register(self.onE2EUnavailable)
+		self.followerSession.e2ePeerUnsupported.register(self.onE2EPeerUnsupported)
+		self.followerSession.e2eIdentityChanged.register(self.onE2EIdentityChanged)
 		if self.sdHandler is not None:
 			self.sdHandler.followerSession = self.followerSession
 		self.followerTransport = transport
@@ -553,6 +556,24 @@ class RemoteClient:
 		"""
 		wnd = dialogs.E2EPeerUnsupportedDialog(gui.mainFrame)
 		if wnd.ShowModal() != wx.ID_YES:
+			self.disconnect()
+
+	@alwaysCallAfter
+	def onE2EIdentityChanged(self, peerId: int, fingerprint: str, oldFingerprint: str = "") -> None:
+		"""Handle a peer's identity key not being in the trusted set for this channel.
+
+		This could indicate a different computer using the same channel or a MITM attack.
+		If the user accepts, the new identity key is added to the trusted set.
+		"""
+		wnd = dialogs.E2EIdentityChangedDialog(
+			gui.mainFrame, fingerprint=fingerprint, oldFingerprint=oldFingerprint,
+		)
+		if wnd.ShowModal() == wx.ID_YES:
+			# User accepted the new identity — update stored key
+			session = self.leaderSession or self.followerSession
+			if session is not None:
+				session.updateTOFUKey(peerId)
+		else:
 			self.disconnect()
 
 	def startControlServer(self, serverPort, channel):

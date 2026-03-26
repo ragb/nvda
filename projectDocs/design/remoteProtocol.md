@@ -242,8 +242,9 @@ the control-plane blacklist.
 
 * Protect data-plane content (keystrokes, speech, clipboard) from the relay server
 * Per-session forward secrecy via ephemeral keys
+* Persistent identity via Ed25519 signing keys with TOFU (Trust On First Use)
 * Pairwise authenticated encryption preventing sender spoofing
-* Fingerprint-based MITM detection
+* Stable fingerprints for out-of-band MITM detection
 
 ### 6.2 Scope
 
@@ -255,9 +256,10 @@ security benefit. The direct-connection server sets `e2e_available: false`.
 
 | Purpose | Algorithm | Library |
 | --- | --- | --- |
-| Key exchange | X25519 (Curve25519 DH) | PyNaCl |
+| Persistent identity | Ed25519 signing key | PyNaCl |
+| Key exchange | X25519 (Curve25519 DH), ephemeral per session | PyNaCl |
 | Authenticated encryption | XSalsa20-Poly1305 (NaCl crypto_box) | PyNaCl |
-| Fingerprint | BLAKE2b (64-bit digest) | hashlib |
+| Fingerprint | BLAKE2b (64-bit digest) over identity keys | hashlib |
 
 ### 6.4 All-or-Nothing Rule
 
@@ -265,23 +267,34 @@ If **any** peer in the channel does not support E2E (`e2e_supported: false`),
 the entire channel operates in plaintext. Mixed mode is not supported because
 the server would see plaintext from/to the non-E2E peer, defeating the purpose.
 
-### 6.5 Key Exchange
+### 6.5 Identity Keys
+
+Each NVDA installation generates a persistent Ed25519 signing keypair on first
+use, stored in the NVDA remote config directory. This key identifies the machine
+across sessions and enables TOFU (Trust On First Use) — see §6.9.
+
+### 6.6 Key Exchange
 
 1. Each client generates an ephemeral X25519 keypair and a random 4-byte nonce
    prefix on session start.
 2. After receiving `channel_joined` with `e2e_available: true` and all peers
-   having `e2e_supported: true`, the client broadcasts its public key:
+   having `e2e_supported: true`, the client signs the ephemeral public key with
+   its persistent Ed25519 identity key and broadcasts the signed key:
 
    ```json
    {
      "type": "e2e_pubkey",
-     "pubkey": "<base64 32-byte X25519 public key>",
-     "nonce_prefix": "<base64 4-byte random prefix>"
+     "pubkey": "<base64 32-byte X25519 ephemeral public key>",
+     "nonce_prefix": "<base64 4-byte random prefix>",
+     "identity_key": "<base64 32-byte Ed25519 verify key>",
+     "signature": "<base64 64-byte Ed25519 signature over pubkey>"
    }
    ```
 
-3. The server relays this with `origin` added. Each receiving client derives a
-   pairwise shared secret using X25519 DH:
+3. The server relays this with `origin` added. Each receiving client:
+   a. Verifies the Ed25519 signature (reject if invalid — possible tampering).
+   b. Performs a TOFU check on the identity key (see §6.9).
+   c. Derives a pairwise shared secret using X25519 DH:
 
    ```
    shared_secret = X25519(own_private_key, peer_public_key)
@@ -289,7 +302,7 @@ the server would see plaintext from/to the non-E2E peer, defeating the purpose.
 
 4. PyNaCl's `Box` class handles the DH derivation and encryption in one step.
 
-### 6.6 Message Encryption
+### 6.7 Message Encryption
 
 For each data-plane message, the sender encrypts separately for each peer:
 
@@ -331,7 +344,7 @@ verification (defense-in-depth). The receiver verifies that `_from` matches
 the outer `origin` field set by the server. A mismatch indicates tampering
 and the message is rejected.
 
-### 6.7 Message Decryption
+### 6.8 Message Decryption
 
 1. Receiver gets `e2e_data` with `origin` (from server) and `to` (from sender)
 2. Checks `to == own_user_id` (ignore messages for other peers)
@@ -341,12 +354,28 @@ and the message is rejected.
 6. Verifies `_from == origin` (defense-in-depth)
 7. Dispatches inner message to normal handlers
 
-### 6.8 Fingerprint Verification
+### 6.9 TOFU (Trust On First Use)
 
-To detect MITM attacks (malicious server substituting public keys):
+On first E2E connection, the peer's persistent Ed25519 identity key is stored
+in the NVDA config, keyed by `(server_address, channel, peer_id)`. On subsequent
+connections:
+
+* **Matches stored key**: the peer is silently trusted — same machine as before.
+* **Changed key**: a strong warning is shown — this may indicate a MITM attack
+  (malicious server substituting keys) or a different person using the same
+  channel. The user can accept the new key or disconnect.
+* **No stored key**: the identity key is stored on first use.
+
+TOFU is vulnerable on the very first connection (no prior key to compare).
+Fingerprint verification (§6.10) provides stronger assurance even on first use.
+
+### 6.10 Fingerprint Verification
+
+Fingerprints are computed from persistent identity keys (not ephemeral session
+keys), so they remain stable across sessions for the same peer:
 
 ```
-sorted_keys = sort([own_public_key, peer_public_key])
+sorted_keys = sort([own_identity_key, peer_identity_key])
 fingerprint = BLAKE2b(sorted_keys[0] || sorted_keys[1], digest_size=8)
 ```
 
@@ -356,11 +385,12 @@ key substitution.
 
 The fingerprint is displayed as a hex string: `"a3f2 91d0 e8c4 7b5a"`.
 
-### 6.9 E2E Session Lifecycle
+### 6.11 E2E Session Lifecycle
 
 1. **Init**: `channel_joined` received with `e2e_available=true`, all peers
-   `e2e_supported=true` -> create `E2ESession`, broadcast `e2e_pubkey`
-2. **Key exchange**: Receive peer `e2e_pubkey` messages, derive pairwise keys
+   `e2e_supported=true` -> create `E2ESession`, broadcast signed `e2e_pubkey`
+2. **Key exchange**: Receive peer `e2e_pubkey` messages, verify signatures,
+   perform TOFU check on identity keys, derive pairwise shared secrets
 3. **Active**: All data-plane sends go through `session.send()` which
    transparently encrypts for each peer
 4. **Peer join**: New E2E peer -> send pubkey to them. New non-E2E peer ->
@@ -368,28 +398,31 @@ The fingerprint is displayed as a hex string: `"a3f2 91d0 e8c4 7b5a"`.
 5. **Peer leave**: Remove peer's key state
 6. **Disconnect**: E2E session destroyed, ephemeral keys discarded
 
-### 6.10 Threat Model
+### 6.12 Threat Model
 
 **Protected**:
 
 * Data-plane content (keystrokes, speech, braille, clipboard) encrypted end-to-end
-* Forward secrecy: ephemeral keys per session
+* Forward secrecy: ephemeral keys per session (compromising the persistent
+  identity key does not reveal past session content)
 * Sender authenticity: pairwise AEAD + `_from` verification
+* Identity continuity: TOFU detects identity key changes across sessions
 
 **Not protected**:
 
 * Metadata: server sees who's in which channel, timing, message sizes
 * Control plane: `protocol_version`, `join`, `generate_key` are plaintext
-* MITM: a malicious server can swap public keys during exchange (detectable
-  only by fingerprint verification)
+* MITM on first connection: a malicious server can swap public keys during
+  the very first key exchange. After first use, TOFU detects key changes.
+  Fingerprint verification out-of-band can detect MITM even on first connection.
 
-### 6.11 Design Compromises vs Signal Protocol
+### 6.13 Design Compromises vs Signal Protocol
 
 | Feature | Signal | NVDA Remote | Rationale |
 | --- | --- | --- | --- |
-| Key exchange | X3DH | Single X25519 DH | No offline messages; both peers online |
+| Key exchange | X3DH | Signed ephemeral X25519 DH | No offline messages; both peers online; Ed25519 signature binds ephemeral to identity |
 | Ratcheting | Double Ratchet | Per-session keys | Per-message forward secrecy unnecessary; session-level is sufficient |
-| Identity keys | Persistent | Ephemeral only | No long-term identity needed; users verify per session |
+| Identity | Key directory | TOFU with persistent Ed25519 | Small stable peer set; no central key server needed |
 | Group keys | Sender keys | Pairwise | 2-4 clients; O(n^2) is fine |
 | Offline messages | Yes | No | Real-time screen reader relay |
 
@@ -433,13 +466,15 @@ E2E is never initiated on direct connections.
 <- {"type":"client_joined","user_id":2,"client":{"id":2,"connection_type":"slave","e2e_supported":true}}
 ```
 
-**Key exchange:**
+**Signed key exchange:**
 
 ```
-A -> {"type":"e2e_pubkey","pubkey":"...base64...","nonce_prefix":"...base64..."}
+A -> {"type":"e2e_pubkey","pubkey":"...","nonce_prefix":"...","identity_key":"...","signature":"..."}
      (server relays to B with origin=1)
-B -> {"type":"e2e_pubkey","pubkey":"...base64...","nonce_prefix":"...base64..."}
+     B verifies signature, TOFU checks identity_key, derives shared secret
+B -> {"type":"e2e_pubkey","pubkey":"...","nonce_prefix":"...","identity_key":"...","signature":"..."}
      (server relays to A with origin=2)
+     A verifies signature, TOFU checks identity_key, derives shared secret
 ```
 
 **Encrypted key press (A -> B):**

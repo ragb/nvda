@@ -562,3 +562,61 @@ class E2EPeerUnsupportedDialog(wx.MessageDialog):
 			# Translators: A button to disconnect the Remote Access connection because the remote computer does not support encryption.
 			_("Disconnect"),
 		)
+
+
+class E2EIdentityChangedDialog(wx.MessageDialog):
+	def __init__(self, parent: wx.Window | None, fingerprint: str, oldFingerprint: str = ""):
+		# Translators: Title of the dialog presented when the remote computer's identity has changed.
+		title = pgettext("remote", "Security Warning")
+		if oldFingerprint:
+			message = pgettext(
+				"remote",
+				# Translators: Message presented when the remote computer's encryption identity has changed
+				# since the last connection. This could indicate a different computer using the same channel,
+				# or a possible security issue.
+				# {oldFingerprint} is the previously trusted encryption fingerprint.
+				# {fingerprint} is the new encryption fingerprint.
+				"The identity of the remote computer has changed since your last connection.\n"
+				"\n"
+				"This could mean a different computer is using the same channel, "
+				"or it could indicate a security issue.\n"
+				"\n"
+				"Previous fingerprint: {oldFingerprint}\n"
+				"New fingerprint: {fingerprint}\n"
+				"\n"
+				"If you were not expecting this change, you should disconnect and verify "
+				"with the other person.\n"
+				"\n"
+				"Continue connecting anyway?",
+			).format(fingerprint=fingerprint, oldFingerprint=oldFingerprint)
+		else:
+			message = pgettext(
+				"remote",
+				# Translators: Message presented when the remote computer's encryption identity has changed
+				# since the last connection. This could indicate a different computer using the same channel,
+				# or a possible security issue.
+				# {fingerprint} is the new encryption fingerprint.
+				"The identity of the remote computer has changed since your last connection.\n"
+				"\n"
+				"This could mean a different computer is using the same channel, "
+				"or it could indicate a security issue.\n"
+				"\n"
+				"New fingerprint: {fingerprint}\n"
+				"\n"
+				"If you were not expecting this change, you should disconnect and verify "
+				"with the other person.\n"
+				"\n"
+				"Continue connecting anyway?",
+			).format(fingerprint=fingerprint)
+		super().__init__(
+			parent,
+			caption=title,
+			message=message,
+			style=wx.YES_NO | wx.NO_DEFAULT | wx.CENTRE,
+		)
+		self.SetYesNoLabels(
+			# Translators: A button to accept the new identity and continue the Remote Access connection.
+			_("Trust and connect"),
+			# Translators: A button to disconnect because the remote computer's identity changed.
+			_("Disconnect"),
+		)

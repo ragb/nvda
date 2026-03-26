@@ -4,40 +4,93 @@
 # See the file COPYING for more details.
 
 import json
+import tempfile
 import unittest
+from pathlib import Path
 
-from _remoteClient.e2e import E2ESession
+from nacl.exceptions import BadSignatureError
+from nacl.signing import SigningKey
+
+from _remoteClient.e2e import E2ESession, loadOrGenerateIdentityKey
+
+
+def _makeSession() -> E2ESession:
+	"""Create an E2ESession with a fresh identity key."""
+	return E2ESession(SigningKey.generate())
+
+
+def _exchangeKeys(alice: E2ESession, bob: E2ESession, aliceId: int = 1, bobId: int = 2) -> None:
+	"""Perform a full signed key exchange between two sessions."""
+	aliceMsg = alice.get_pubkey_message()
+	bobMsg = bob.get_pubkey_message()
+	alice.add_peer(bobId, bobMsg["pubkey"], bobMsg["nonce_prefix"], bobMsg["identity_key"], bobMsg["signature"])
+	bob.add_peer(aliceId, aliceMsg["pubkey"], aliceMsg["nonce_prefix"], aliceMsg["identity_key"], aliceMsg["signature"])
 
 
 class TestE2EKeyExchange(unittest.TestCase):
 	"""Test E2E key exchange and pairwise key establishment."""
 
 	def test_pubkeyMessageFormat(self):
-		session = E2ESession()
+		session = _makeSession()
 		msg = session.get_pubkey_message()
 		self.assertIn("pubkey", msg)
 		self.assertIn("nonce_prefix", msg)
-		self.assertIsInstance(msg["pubkey"], str)
-		self.assertIsInstance(msg["nonce_prefix"], str)
+		self.assertIn("identity_key", msg)
+		self.assertIn("signature", msg)
+		for key in msg:
+			self.assertIsInstance(msg[key], str)
 
 	def test_addPeerEstablishesKey(self):
-		alice = E2ESession()
-		bob = E2ESession()
+		alice = _makeSession()
+		bob = _makeSession()
 		aliceMsg = alice.get_pubkey_message()
-		bob.add_peer(1, aliceMsg["pubkey"], aliceMsg["nonce_prefix"])
+		bob.add_peer(1, aliceMsg["pubkey"], aliceMsg["nonce_prefix"], aliceMsg["identity_key"], aliceMsg["signature"])
 		self.assertTrue(bob.has_peer(1))
 		self.assertIn(1, bob.peer_ids)
 
-	def test_removePeer(self):
-		alice = E2ESession()
-		bob = E2ESession()
+	def test_addPeerReturnsIdentityKey(self):
+		alice = _makeSession()
+		bob = _makeSession()
 		aliceMsg = alice.get_pubkey_message()
-		bob.add_peer(1, aliceMsg["pubkey"], aliceMsg["nonce_prefix"])
+		identity = bob.add_peer(
+			1, aliceMsg["pubkey"], aliceMsg["nonce_prefix"], aliceMsg["identity_key"], aliceMsg["signature"],
+		)
+		self.assertEqual(identity, alice._identityKey.verify_key)
+
+	def test_invalidSignatureRejected(self):
+		alice = _makeSession()
+		bob = _makeSession()
+		aliceMsg = alice.get_pubkey_message()
+		# Tamper with the signature
+		import base64
+
+		bad_sig = base64.b64encode(b"\x00" * 64).decode("ascii")
+		with self.assertRaises(BadSignatureError):
+			bob.add_peer(1, aliceMsg["pubkey"], aliceMsg["nonce_prefix"], aliceMsg["identity_key"], bad_sig)
+
+	def test_wrongIdentityKeyRejected(self):
+		"""Signature from a different identity key should fail verification."""
+		alice = _makeSession()
+		bob = _makeSession()
+		eve = _makeSession()
+		aliceMsg = alice.get_pubkey_message()
+		# Use Eve's identity key with Alice's signature — should fail
+		with self.assertRaises(BadSignatureError):
+			bob.add_peer(
+				1, aliceMsg["pubkey"], aliceMsg["nonce_prefix"],
+				eve.identity_key_b64, aliceMsg["signature"],
+			)
+
+	def test_removePeer(self):
+		alice = _makeSession()
+		bob = _makeSession()
+		aliceMsg = alice.get_pubkey_message()
+		bob.add_peer(1, aliceMsg["pubkey"], aliceMsg["nonce_prefix"], aliceMsg["identity_key"], aliceMsg["signature"])
 		bob.remove_peer(1)
 		self.assertFalse(bob.has_peer(1))
 
 	def test_removeNonexistentPeerNoError(self):
-		session = E2ESession()
+		session = _makeSession()
 		session.remove_peer(999)
 
 
@@ -45,12 +98,9 @@ class TestE2EEncryptDecrypt(unittest.TestCase):
 	"""Test encryption and decryption of messages."""
 
 	def setUp(self):
-		self.alice = E2ESession()
-		self.bob = E2ESession()
-		aliceMsg = self.alice.get_pubkey_message()
-		bobMsg = self.bob.get_pubkey_message()
-		self.alice.add_peer(2, bobMsg["pubkey"], bobMsg["nonce_prefix"])
-		self.bob.add_peer(1, aliceMsg["pubkey"], aliceMsg["nonce_prefix"])
+		self.alice = _makeSession()
+		self.bob = _makeSession()
+		_exchangeKeys(self.alice, self.bob)
 
 	def test_encryptProducesOneMessagePerPeer(self):
 		messages = self.alice.encrypt("key", from_id=1, vk_code=65, pressed=True)
@@ -101,33 +151,43 @@ class TestE2EEncryptDecrypt(unittest.TestCase):
 	def test_originMismatchReturnsNone(self):
 		"""Inner _from must match the outer origin_id."""
 		messages = self.alice.encrypt("key", from_id=1, vk_code=65, pressed=True)
-		# Decrypt with wrong origin_id (pretend server lied about origin)
-		# This won't decrypt at all since bob has no key for peer 999
 		result = self.bob.decrypt(999, messages[0]["ciphertext"], messages[0]["nonce"])
 		self.assertIsNone(result)
 
 
 class TestE2EFingerprint(unittest.TestCase):
-	"""Test fingerprint generation for MITM detection."""
+	"""Test fingerprint generation based on persistent identity keys."""
 
 	def test_fingerprintMatchesBothSides(self):
-		alice = E2ESession()
-		bob = E2ESession()
-		aliceMsg = alice.get_pubkey_message()
-		bobMsg = bob.get_pubkey_message()
-		alice.add_peer(2, bobMsg["pubkey"], bobMsg["nonce_prefix"])
-		bob.add_peer(1, aliceMsg["pubkey"], aliceMsg["nonce_prefix"])
+		alice = _makeSession()
+		bob = _makeSession()
+		_exchangeKeys(alice, bob)
 		self.assertEqual(alice.get_fingerprint(2), bob.get_fingerprint(1))
 
+	def test_fingerprintStableAcrossSessions(self):
+		"""Same identity keys should produce the same fingerprint in different sessions."""
+		identityA = SigningKey.generate()
+		identityB = SigningKey.generate()
+		# Session 1
+		alice1 = E2ESession(identityA)
+		bob1 = E2ESession(identityB)
+		_exchangeKeys(alice1, bob1)
+		fp1 = alice1.get_fingerprint(2)
+		# Session 2 (new ephemeral keys, same identity)
+		alice2 = E2ESession(identityA)
+		bob2 = E2ESession(identityB)
+		_exchangeKeys(alice2, bob2)
+		fp2 = alice2.get_fingerprint(2)
+		self.assertEqual(fp1, fp2)
+
 	def test_fingerprintForUnknownPeerReturnsNone(self):
-		session = E2ESession()
+		session = _makeSession()
 		self.assertIsNone(session.get_fingerprint(999))
 
 	def test_fingerprintFormat(self):
-		alice = E2ESession()
-		bob = E2ESession()
-		bobMsg = bob.get_pubkey_message()
-		alice.add_peer(2, bobMsg["pubkey"], bobMsg["nonce_prefix"])
+		alice = _makeSession()
+		bob = _makeSession()
+		_exchangeKeys(alice, bob)
 		fingerprint = alice.get_fingerprint(2)
 		self.assertIsNotNone(fingerprint)
 		# Should be 4 groups of 4 hex chars separated by spaces
@@ -142,30 +202,58 @@ class TestE2EMultiplePeers(unittest.TestCase):
 	"""Test E2E with more than two peers in a channel."""
 
 	def test_encryptForMultiplePeers(self):
-		alice = E2ESession()
-		bob = E2ESession()
-		carol = E2ESession()
+		alice = _makeSession()
+		bob = _makeSession()
+		carol = _makeSession()
 		bobMsg = bob.get_pubkey_message()
 		carolMsg = carol.get_pubkey_message()
-		alice.add_peer(2, bobMsg["pubkey"], bobMsg["nonce_prefix"])
-		alice.add_peer(3, carolMsg["pubkey"], carolMsg["nonce_prefix"])
+		alice.add_peer(2, bobMsg["pubkey"], bobMsg["nonce_prefix"], bobMsg["identity_key"], bobMsg["signature"])
+		alice.add_peer(3, carolMsg["pubkey"], carolMsg["nonce_prefix"], carolMsg["identity_key"], carolMsg["signature"])
 		messages = alice.encrypt("key", from_id=1, vk_code=65, pressed=True)
 		self.assertEqual(len(messages), 2)
 		recipients = {m["to"] for m in messages}
 		self.assertEqual(recipients, {2, 3})
 
 	def test_removePeerReducesRecipients(self):
-		alice = E2ESession()
-		bob = E2ESession()
-		carol = E2ESession()
+		alice = _makeSession()
+		bob = _makeSession()
+		carol = _makeSession()
 		bobMsg = bob.get_pubkey_message()
 		carolMsg = carol.get_pubkey_message()
-		alice.add_peer(2, bobMsg["pubkey"], bobMsg["nonce_prefix"])
-		alice.add_peer(3, carolMsg["pubkey"], carolMsg["nonce_prefix"])
+		alice.add_peer(2, bobMsg["pubkey"], bobMsg["nonce_prefix"], bobMsg["identity_key"], bobMsg["signature"])
+		alice.add_peer(3, carolMsg["pubkey"], carolMsg["nonce_prefix"], carolMsg["identity_key"], carolMsg["signature"])
 		alice.remove_peer(3)
 		messages = alice.encrypt("key", from_id=1, vk_code=65, pressed=True)
 		self.assertEqual(len(messages), 1)
 		self.assertEqual(messages[0]["to"], 2)
+
+
+class TestIdentityKeyPersistence(unittest.TestCase):
+	"""Test persistent identity key loading and generation."""
+
+	def test_generateAndReload(self):
+		with tempfile.TemporaryDirectory() as tmpdir:
+			keyDir = Path(tmpdir)
+			key1 = loadOrGenerateIdentityKey(keyDir)
+			key2 = loadOrGenerateIdentityKey(keyDir)
+			self.assertEqual(bytes(key1.verify_key), bytes(key2.verify_key))
+
+	def test_generateCreatesFile(self):
+		with tempfile.TemporaryDirectory() as tmpdir:
+			keyDir = Path(tmpdir)
+			loadOrGenerateIdentityKey(keyDir)
+			self.assertTrue((keyDir / "identity.key").exists())
+			self.assertEqual(len((keyDir / "identity.key").read_bytes()), 32)
+
+	def test_corruptedKeyRegenerates(self):
+		with tempfile.TemporaryDirectory() as tmpdir:
+			keyDir = Path(tmpdir)
+			key1 = loadOrGenerateIdentityKey(keyDir)
+			# Corrupt the key file
+			(keyDir / "identity.key").write_bytes(b"bad")
+			key2 = loadOrGenerateIdentityKey(keyDir)
+			# Should have generated a new key
+			self.assertNotEqual(bytes(key1.verify_key), bytes(key2.verify_key))
 
 
 if __name__ == "__main__":
