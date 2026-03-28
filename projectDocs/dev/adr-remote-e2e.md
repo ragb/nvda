@@ -24,11 +24,11 @@
 NVDA Remote Access allows two NVDA instances to communicate either through a relay server or by connecting directly to another host.
 All connections (both direct and relay) are already encrypted using TLS, so data is protected from network eavesdroppers.
 However, when using a relay server, the server terminates TLS on both sides: it decrypts traffic from client A, reads the plaintext, and re-encrypts it before forwarding to client B.
-This means that anyone with access to the relay server — whether the operator or an attacker who compromises it — can see all session content: keystrokes, speech output, braille display data, and clipboard text.
+This means that anyone with access to the relay server — whether the operator or an attacker who compromises it — can not only see all session content (keystrokes, speech output, braille display data, and clipboard text) but also **inject or modify messages, effectively gaining full control of the remote computer**. The relay carries input commands (keystrokes, braille input) that the follower machine executes — a compromised relay can forge these commands to type, launch applications, or perform any action the leader could.
 
-Users who connect through public or third-party relay servers must fully trust both the operator and the security of the server infrastructure.
-There is currently no way to verify that a relay server is not logging or inspecting session content.
-E2E encryption also reduces liability for relay operators — they cannot leak data they never had access to in the first place.
+Users who connect through public or third-party relay servers must fully trust both the operator and the security of the server infrastructure with complete control over the remote machine.
+There is currently no way to verify that a relay server is not intercepting or tampering with session content.
+E2E encryption also reduces liability for relay operators — they cannot leak or tamper with data they never had access to in the first place.
 
 **Direct connections are not affected.**
 When one NVDA instance connects directly to another (via "Host control server"), the TLS tunnel runs point-to-point between the two machines with no intermediary.
@@ -121,8 +121,8 @@ To keep the real channel key hidden from the server, clients send a hash of the 
 The protocol version would be bumped from 2 to 3.
 Two new message types would be added:
 
-* `e2e_pubkey` — broadcast by each client after joining, carries the ephemeral X25519 public key and a nonce prefix.
-* `e2e_data` — encrypted data-plane message addressed to a specific peer.
+* `e2e_pubkey` — broadcast by each client after joining. Fields: `pubkey` (base64 X25519 ephemeral public key), `nonce_prefix` (base64 4-byte random prefix).
+* `e2e_data` — encrypted data-plane message addressed to a specific peer. Fields: `to` (recipient's `user_id`), `ciphertext` (base64 encrypted payload), `nonce` (base64 24-byte nonce). The server adds `origin` (sender's `user_id`). When the server sees the `to` field, it should forward the message only to that peer instead of broadcasting.
 
 The `JOIN` message would send a SHA-256 hash of the channel key instead of the raw key. The server uses this hash as the channel routing label. Since the server treats the channel key as an opaque string, this requires no server-side changes — the hash is just a different string.
 
@@ -130,7 +130,7 @@ The `JOIN` message would send a SHA-256 hash of the channel key instead of the r
 
 #### Relay server changes
 
-The relay server would need three small, additive changes (no new dependencies, no cryptographic code):
+The relay server would need four small, additive changes (no new dependencies, no cryptographic code):
 
 1. **Add `e2e_supported` to client info**: Derived from the client's protocol version (>= 3). Included in join/leave notifications and the channel member list.
 
@@ -139,6 +139,8 @@ The relay server would need three small, additive changes (no new dependencies, 
 3. **Add `e2e_available` to the channel join response**: A server-level boolean flag (default true). The protocol supports operators disabling E2E by setting this to `false` — for example, to run a debugging or monitoring relay where traffic inspection is required, to operate a relay for automated testing where encryption overhead is undesirable, or to comply with organizational policies that require server-side logging. Server implementations are free to expose this as a configuration option or hardcode it to the default. When `e2e_available` is `false`, v3 clients must not initiate E2E and should always warn the user that the session is not end-to-end encrypted.
 
 The server would not parse `e2e_pubkey` or `e2e_data` — they would be unknown message types that pass through the existing opaque relay path. The total change is minimal and fully backward compatible with v2 clients.
+
+4. **Optional `to`-based routing for relayed messages**: When any relayed message includes a `to` field, the server should forward it only to the peer with that `user_id` instead of broadcasting to all channel members. If `to` is absent, the server broadcasts as usual (v2 behavior). This is not strictly required — `e2e_data` messages can only be decrypted by the addressed peer regardless — but it avoids sending useless ciphertext to peers who cannot decrypt it.
 
 These v3 changes are already implemented in the [Rust relay server](https://github.com/ragb/nvda-remote-server-rs). The Python relay server (nvaccess/remote-server) would still need them — approximately 20-30 lines of Python, no new dependencies, no cryptographic code.
 
@@ -232,6 +234,7 @@ Using heavier frameworks like Signal Protocol or Noise would add unnecessary com
 **Negative:**
 
 * **E2E clients and non-E2E clients cannot share a channel.** Channel key hashing means the server sees different routing labels from old and new clients. This is intentional (mixed channels defeat E2E) but means users connecting to old peers must disable E2E via the user setting.
+* **Client-side fan-out replaces server broadcast.** Without E2E, a client sends one message and the server broadcasts it to all channel members. With E2E, each message is encrypted separately per peer (pairwise keys), so the client sends N-1 copies — one per peer. For 2-4 clients this is negligible, but it shifts bandwidth and CPU cost from the server to the client.
 * New dependency: PyNaCl (~1.3 MB, wraps libsodium). Bundled into the NVDA binary — no impact on end-user installation. Well-maintained and widely used.
 * Slight per-message overhead from encryption/decryption. For the volume of messages in a screen reader relay (tens per second at most), this is negligible.
 

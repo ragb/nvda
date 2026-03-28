@@ -150,15 +150,19 @@ class E2ESession:
 			transport.send(RemoteMessageType.E2E_DATA, **msg)
 
 		The sender's user_id is included inside the encrypted payload as '_from'
-		for origin authenticity verification (defense-in-depth against a server
-		that lies about the outer 'origin' field).
+		for authenticity verification (defense-in-depth against a server that
+		lies about the outer origin field).
+
+		A '_to' field is intentionally omitted: pairwise SecretBox keys already
+		ensure only the intended recipient can decrypt, and the '_from' check
+		covers reflection attacks (server replaying your own message back to you).
 		"""
-		plaintext = json.dumps({"type": type, "_from": from_id, **kwargs}).encode("utf-8")
 		messages = []
 		for peer in self._peers.values():
 			if peer.box is None:
 				log.error(f"E2E: Peer {peer.peer_id} has no derived box, skipping encryption")
 				continue
+			plaintext = json.dumps({"type": type, "_from": from_id, **kwargs}).encode("utf-8")
 			nonce = self._make_nonce(peer)
 			ciphertext = peer.box.encrypt(plaintext, nonce).ciphertext
 			messages.append(
@@ -188,15 +192,15 @@ class E2ESession:
 		:param serialized_kwargs: The message kwargs serialized as JSON bytes
 			(should be a JSON object without 'type' and '_from').
 		"""
-		obj = json.loads(serialized_kwargs)
-		obj["type"] = type
-		obj["_from"] = from_id
-		plaintext = json.dumps(obj).encode("utf-8")
 		messages = []
 		for peer in self._peers.values():
 			if peer.box is None:
 				log.error(f"E2E: Peer {peer.peer_id} has no derived box, skipping encryption")
 				continue
+			obj = json.loads(serialized_kwargs)
+			obj["type"] = type
+			obj["_from"] = from_id
+			plaintext = json.dumps(obj).encode("utf-8")
 			nonce = self._make_nonce(peer)
 			ciphertext = peer.box.encrypt(plaintext, nonce).ciphertext
 			messages.append(

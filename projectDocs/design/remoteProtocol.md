@@ -153,6 +153,15 @@ connection alive through NAT/firewalls. No response is required.
 These messages are relayed opaquely by the server to all other channel members.
 The server adds an `origin` field (v2+) containing the sender's `user_id`.
 
+`e2e_data` messages include a `to` field (v3+) containing the intended
+recipient's `user_id`. Since each E2E message is encrypted per-recipient with a
+different pairwise key, each `e2e_data` is addressed to a specific peer. When
+the server sees a `to` field, it should forward the message only to that peer
+instead of broadcasting to all channel members. This is a routing optimization
+— only the addressed peer can decrypt the message regardless. If the server
+does not support `to`-based routing, it may broadcast and the recipient filters
+client-side.
+
 ### Input Messages (leader -> follower)
 
 | Type | Fields | Description |
