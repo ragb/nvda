@@ -664,9 +664,11 @@ class RelayTransport(TCPTransport):
 		"""
 		self.send(RemoteMessageType.PROTOCOL_VERSION, version=self.protocolVersion)
 		if self.channel is not None:
+			from .e2e import hashChannelKey
+
 			self.send(
 				RemoteMessageType.JOIN,
-				channel=self.channel,
+				channel=hashChannelKey(self.channel),
 				connection_type=self.connectionType,
 			)
 		else:

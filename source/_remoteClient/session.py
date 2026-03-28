@@ -63,11 +63,9 @@ See Also:
 """
 
 from collections.abc import Collection
-import base64
 import hashlib
 import json
 from collections import defaultdict
-from pathlib import Path
 from extensionPoints import Action
 from typing import Any, Final
 
@@ -85,10 +83,8 @@ from nvwave import decide_playWaveFile
 from speech.extensions import post_speechPaused, pre_speechQueued, speechCanceled
 
 from . import configuration, connectionInfo, cues
-from nacl.exceptions import BadSignatureError
-from nacl.signing import VerifyKey
 
-from .e2e import E2ESession, loadOrGenerateIdentityKey
+from .e2e import E2ESession
 from .localMachine import LocalMachine
 from .protocol import RemoteMessageType
 from .serializer import SpeechCommandJSONEncoder, asSequence
@@ -169,18 +165,6 @@ class RemoteSession:
 		self.callbacksAdded = False
 		self.transport = transport
 		self._isDirectConnection: bool = isDirectConnection
-		# Load or generate persistent Ed25519 identity key for TOFU
-		from NVDAState import WritePaths
-
-		self._identityKey = loadOrGenerateIdentityKey(
-			Path(WritePaths.remoteAccessDir, "e2e"),
-		)
-		self.e2eIdentityChanged: Action = Action()
-		"""Fired when a peer's persistent identity key is not in the trusted
-		set for this channel. This may indicate a MITM attack or a different
-		person using the same channel. Handlers receive keyword arguments
-		``peerId`` (int), ``fingerprint`` (str), and ``oldFingerprint`` (str).
-		"""
 		self.e2eUnavailable: Action = Action()
 		"""Fired when E2E encryption cannot be established because the server
 		does not support it. Handlers receive keyword argument
@@ -359,7 +343,8 @@ class RemoteSession:
 			return
 		all_peers_e2e = all(self._peerE2ESupport.values()) if self._peerE2ESupport else True
 		if all_peers_e2e:
-			self.e2e = E2ESession(self._identityKey)
+			channelKey = getattr(self.transport, "channel", "") or ""
+			self.e2e = E2ESession(channelKey)
 			self.transport.send(RemoteMessageType.E2E_PUBKEY, **self.e2e.get_pubkey_message())
 			log.info("E2E: Session initialized, public key broadcast")
 		else:
@@ -371,101 +356,15 @@ class RemoteSession:
 		pubkey: str,
 		nonce_prefix: str,
 		origin: int,
-		identity_key: str = "",
-		signature: str = "",
 		**kwargs: Any,
 	) -> None:
-		"""Process a peer's public key: verify signature, derive shared secret, TOFU check."""
+		"""Process a peer's public key: derive HKDF-bound shared secret."""
 		if self.e2e is None:
-			return
-		if not identity_key or not signature:
-			log.warning("E2E: Peer %d sent pubkey without identity key or signature, ignoring", origin)
 			return
 		hadPeers = bool(self.e2e.peer_ids)
-		try:
-			peerIdentity = self.e2e.add_peer(origin, pubkey, nonce_prefix, identity_key, signature)
-		except BadSignatureError:
-			log.error("E2E: Invalid signature from peer %d, rejecting key exchange", origin)
-			return
+		self.e2e.add_peer(origin, pubkey, nonce_prefix)
 		if not hadPeers:
 			self.e2eEstablished.notify()
-		self._checkTOFU(origin, peerIdentity)
-
-	def _getTOFUKey(self) -> str:
-		"""Build a TOFU store key for this channel: 'host:port/channel'."""
-		address = self.transport.address
-		host = f"{address[0]}:{address[1]}" if address else "unknown"
-		channel = getattr(self.transport, "channel", "") or ""
-		return f"{host}/{channel}"
-
-	def _checkTOFU(self, peerId: int, peerIdentity: VerifyKey) -> None:
-		"""Check Trust On First Use for a peer's persistent identity key.
-
-		Identity keys are stored as a comma-separated set per channel
-		(keyed by server_address/channel). A new identity key not previously
-		seen on the channel triggers a warning.
-		"""
-		conf = configuration.getRemoteConfig()
-		tofuKey = self._getTOFUKey()
-		storedRaw = conf["trustedIdentityKeys"].get(tofuKey, "")
-		trustedSet = set(storedRaw.split(",")) if storedRaw else set()
-		currentB64 = base64.b64encode(bytes(peerIdentity)).decode("ascii")
-		if currentB64 in trustedSet:
-			log.debug("E2E: TOFU — peer %d identity matches stored key on %s", peerId, tofuKey)
-		elif not trustedSet:
-			# First use on this channel — store the identity key
-			conf["trustedIdentityKeys"][tofuKey] = currentB64
-			log.info("E2E: TOFU — stored first identity key for %s", tofuKey)
-		else:
-			# New identity on a channel with existing trusted keys — warn the user
-			log.warning(
-				"E2E: TOFU — peer %d has unknown identity on %s. "
-				"Possible MITM or new computer.",
-				peerId,
-				tofuKey,
-			)
-			newFingerprint = self.e2e.get_fingerprint(peerId) if self.e2e else None
-			oldFingerprint = self._computeOldFingerprint(storedRaw)
-			self.e2eIdentityChanged.notify(
-				peerId=peerId,
-				fingerprint=newFingerprint or "",
-				oldFingerprint=oldFingerprint or "",
-			)
-
-	def _computeOldFingerprint(self, storedRaw: str) -> str | None:
-		"""Compute a fingerprint from a previously stored identity key.
-
-		Uses the same BLAKE2b logic as :meth:`E2ESession.get_fingerprint`
-		but works from the raw base64 string stored in config.
-		"""
-		if not storedRaw:
-			return None
-		# Use the last key in the comma-separated set
-		lastB64 = storedRaw.split(",")[-1]
-		try:
-			storedIdentity = base64.b64decode(lastB64)
-			ownIdentity = bytes(self._identityKey.verify_key)
-			keys = sorted([ownIdentity, storedIdentity])
-			digest = hashlib.blake2b(keys[0] + keys[1], digest_size=8).hexdigest()
-			return " ".join(digest[i : i + 4] for i in range(0, len(digest), 4))
-		except Exception:
-			return None
-
-	def updateTOFUKey(self, peerId: int) -> None:
-		"""Add the peer's identity key to the trusted set after user confirmation."""
-		if self.e2e is None:
-			return
-		peer = self.e2e._peers.get(peerId)
-		if peer is None:
-			return
-		conf = configuration.getRemoteConfig()
-		tofuKey = self._getTOFUKey()
-		storedRaw = conf["trustedIdentityKeys"].get(tofuKey, "")
-		trustedSet = set(storedRaw.split(",")) if storedRaw else set()
-		currentB64 = base64.b64encode(bytes(peer.identity_key)).decode("ascii")
-		trustedSet.add(currentB64)
-		conf["trustedIdentityKeys"][tofuKey] = ",".join(trustedSet)
-		log.info("E2E: TOFU — user accepted new identity for peer %d on %s", peerId, tofuKey)
 
 	def _handleE2EData(self, ciphertext: str, nonce: str, origin: int, to: int, **kwargs: Any) -> None:
 		"""Decrypt an E2E message and dispatch the inner message."""

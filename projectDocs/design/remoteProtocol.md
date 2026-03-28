@@ -69,10 +69,12 @@ and reconnects using this key in a `join` message.
 ### 3.3 `join` (client -> server)
 
 ```json
-{"type": "join", "channel": "123456789", "connection_type": "master"}
+{"type": "join", "channel": "15e2b0d3c33891ebb0f1ef609ec419420c20e320ce94c65fbc8c3312448eb225", "connection_type": "master"}
 ```
 
-* `channel`: The channel key (string). Acts as a shared secret for room joining.
+* `channel`: When E2E is supported (v3), this is the **SHA-256 hash** of the
+  channel key (hex-encoded). The server never sees the real channel key. For
+  legacy clients (v1/v2), this may be the raw channel key string.
 * `connection_type`: `"master"` (leader/controller) or `"slave"` (follower/controlled).
   This is metadata only; the server treats both identically for relay purposes.
 
@@ -242,9 +244,8 @@ the control-plane blacklist.
 
 * Protect data-plane content (keystrokes, speech, clipboard) from the relay server
 * Per-session forward secrecy via ephemeral keys
-* Persistent identity via Ed25519 signing keys with TOFU (Trust On First Use)
+* MITM resistance via channel-key binding in key derivation (no persistent identity keys needed)
 * Pairwise authenticated encryption preventing sender spoofing
-* Stable fingerprints for out-of-band MITM detection
 
 ### 6.2 Scope
 
@@ -256,10 +257,10 @@ security benefit. The direct-connection server sets `e2e_available: false`.
 
 | Purpose | Algorithm | Library |
 | --- | --- | --- |
-| Persistent identity | Ed25519 signing key | PyNaCl |
+| Channel key hashing | SHA-256 (channel key hashed before sending in JOIN) | hashlib |
 | Key exchange | X25519 (Curve25519 DH), ephemeral per session | PyNaCl |
-| Authenticated encryption | XSalsa20-Poly1305 (NaCl crypto_box) | PyNaCl |
-| Fingerprint | BLAKE2b (64-bit digest) over identity keys | hashlib |
+| Key derivation | HKDF-SHA256 (DH shared secret + channel key as salt) | hmac + hashlib |
+| Authenticated encryption | XSalsa20-Poly1305 (SecretBox) | PyNaCl |
 
 ### 6.4 All-or-Nothing Rule
 
@@ -267,40 +268,50 @@ If **any** peer in the channel does not support E2E (`e2e_supported: false`),
 the entire channel operates in plaintext. Mixed mode is not supported because
 the server would see plaintext from/to the non-E2E peer, defeating the purpose.
 
-### 6.5 Identity Keys
+### 6.5 Channel Key Hashing
 
-Each NVDA installation generates a persistent Ed25519 signing keypair on first
-use, stored in the NVDA remote config directory. This key identifies the machine
-across sessions and enables TOFU (Trust On First Use) — see §6.9.
+Clients hash the channel key with SHA-256 before sending it to the server in
+the `join` message. The server uses the hash to group clients into channels but
+never learns the real channel key. This is critical for E2E security — the
+channel key is later used in HKDF key derivation, so the server cannot derive
+the encryption keys even if it substitutes ephemeral public keys during key
+exchange.
+
+```
+channel_hash = SHA-256(channel_key)
+```
+
+The `join` message sends `channel_hash` instead of the raw channel key.
 
 ### 6.6 Key Exchange
 
 1. Each client generates an ephemeral X25519 keypair and a random 4-byte nonce
    prefix on session start.
 2. After receiving `channel_joined` with `e2e_available: true` and all peers
-   having `e2e_supported: true`, the client signs the ephemeral public key with
-   its persistent Ed25519 identity key and broadcasts the signed key:
+   having `e2e_supported: true`, the client broadcasts its ephemeral public key:
 
    ```json
    {
      "type": "e2e_pubkey",
      "pubkey": "<base64 32-byte X25519 ephemeral public key>",
-     "nonce_prefix": "<base64 4-byte random prefix>",
-     "identity_key": "<base64 32-byte Ed25519 verify key>",
-     "signature": "<base64 64-byte Ed25519 signature over pubkey>"
+     "nonce_prefix": "<base64 4-byte random prefix>"
    }
    ```
 
-3. The server relays this with `origin` added. Each receiving client:
-   a. Verifies the Ed25519 signature (reject if invalid — possible tampering).
-   b. Performs a TOFU check on the identity key (see §6.9).
-   c. Derives a pairwise shared secret using X25519 DH:
+3. The server relays this with `origin` added. Each receiving client derives
+   a pairwise encryption key:
 
    ```
-   shared_secret = X25519(own_private_key, peer_public_key)
+   dh_shared_secret = X25519(own_private_key, peer_public_key)
+   derived_key = HKDF-SHA256(ikm=dh_shared_secret, salt=channel_key, info="nvda-remote-e2e")
    ```
 
-4. PyNaCl's `Box` class handles the DH derivation and encryption in one step.
+   The channel key (known only to the clients, never sent to the server in
+   plaintext) is used as the HKDF salt. This binds the derived key to knowledge
+   of the real channel key, making MITM cryptographically impossible without it.
+
+4. The derived key is used with SecretBox (XSalsa20-Poly1305) for authenticated
+   encryption.
 
 ### 6.7 Message Encryption
 
@@ -354,43 +365,12 @@ and the message is rejected.
 6. Verifies `_from == origin` (defense-in-depth)
 7. Dispatches inner message to normal handlers
 
-### 6.9 TOFU (Trust On First Use)
-
-On first E2E connection, the peer's persistent Ed25519 identity key is stored
-in the NVDA config, keyed by `(server_address, channel, peer_id)`. On subsequent
-connections:
-
-* **Matches stored key**: the peer is silently trusted — same machine as before.
-* **Changed key**: a strong warning is shown — this may indicate a MITM attack
-  (malicious server substituting keys) or a different person using the same
-  channel. The user can accept the new key or disconnect.
-* **No stored key**: the identity key is stored on first use.
-
-TOFU is vulnerable on the very first connection (no prior key to compare).
-Fingerprint verification (§6.10) provides stronger assurance even on first use.
-
-### 6.10 Fingerprint Verification
-
-Fingerprints are computed from persistent identity keys (not ephemeral session
-keys), so they remain stable across sessions for the same peer:
-
-```
-sorted_keys = sort([own_identity_key, peer_identity_key])
-fingerprint = BLAKE2b(sorted_keys[0] || sorted_keys[1], digest_size=8)
-```
-
-Both sides compute the same fingerprint (keys are sorted before hashing).
-Users verify out-of-band (phone call, separate chat). A mismatch indicates
-key substitution.
-
-The fingerprint is displayed as a hex string: `"a3f2 91d0 e8c4 7b5a"`.
-
-### 6.11 E2E Session Lifecycle
+### 6.9 E2E Session Lifecycle
 
 1. **Init**: `channel_joined` received with `e2e_available=true`, all peers
-   `e2e_supported=true` -> create `E2ESession`, broadcast signed `e2e_pubkey`
-2. **Key exchange**: Receive peer `e2e_pubkey` messages, verify signatures,
-   perform TOFU check on identity keys, derive pairwise shared secrets
+   `e2e_supported=true` -> create `E2ESession`, broadcast `e2e_pubkey`
+2. **Key exchange**: Receive peer `e2e_pubkey` messages, perform X25519 DH,
+   derive pairwise encryption keys via HKDF with channel key as salt
 3. **Active**: All data-plane sends go through `session.send()` which
    transparently encrypts for each peer
 4. **Peer join**: New E2E peer -> send pubkey to them. New non-E2E peer ->
@@ -398,31 +378,31 @@ The fingerprint is displayed as a hex string: `"a3f2 91d0 e8c4 7b5a"`.
 5. **Peer leave**: Remove peer's key state
 6. **Disconnect**: E2E session destroyed, ephemeral keys discarded
 
-### 6.12 Threat Model
+### 6.10 Threat Model
 
 **Protected**:
 
 * Data-plane content (keystrokes, speech, braille, clipboard) encrypted end-to-end
-* Forward secrecy: ephemeral keys per session (compromising the persistent
-  identity key does not reveal past session content)
+* Forward secrecy: ephemeral keys per session
+* MITM resistance: channel key binding in HKDF means even a malicious server
+  operator cannot derive encryption keys without knowing the real channel key
 * Sender authenticity: pairwise AEAD + `_from` verification
-* Identity continuity: TOFU detects identity key changes across sessions
 
 **Not protected**:
 
 * Metadata: server sees who's in which channel, timing, message sizes
 * Control plane: `protocol_version`, `join`, `generate_key` are plaintext
-* MITM on first connection: a malicious server can swap public keys during
-  the very first key exchange. After first use, TOFU detects key changes.
-  Fingerprint verification out-of-band can detect MITM even on first connection.
+  (but channel key is hashed before sending)
+* Weak channel keys: if the channel key has low entropy (e.g., a short numeric
+  string), a server operator could brute-force the SHA-256 hash to recover it
 
-### 6.13 Design Compromises vs Signal Protocol
+### 6.11 Design Compromises vs Signal Protocol
 
 | Feature | Signal | NVDA Remote | Rationale |
 | --- | --- | --- | --- |
-| Key exchange | X3DH | Signed ephemeral X25519 DH | No offline messages; both peers online; Ed25519 signature binds ephemeral to identity |
+| Key exchange | X3DH | Ephemeral X25519 DH + HKDF channel-key binding | No offline messages; both peers online; channel key provides authentication |
 | Ratcheting | Double Ratchet | Per-session keys | Per-message forward secrecy unnecessary; session-level is sufficient |
-| Identity | Key directory | TOFU with persistent Ed25519 | Small stable peer set; no central key server needed |
+| MITM protection | Identity keys + safety numbers | Channel key binding in HKDF | Cryptographic, not trust-based; no user action needed beyond sharing channel key |
 | Group keys | Sender keys | Pairwise | 2-4 clients; O(n^2) is fine |
 | Offline messages | Yes | No | Real-time screen reader relay |
 
@@ -443,12 +423,12 @@ E2E is never initiated on direct connections.
 
 ### Complete E2E Session (Two Clients)
 
-**Client A connects and joins:**
+**Client A connects and joins (channel key hashed with SHA-256):**
 
 ```
 -> {"type":"protocol_version","version":3}
--> {"type":"join","channel":"123456789","connection_type":"master"}
-<- {"type":"channel_joined","channel":"123456789","user_id":1,"user_ids":[],"clients":[],"e2e_available":true}
+-> {"type":"join","channel":"<SHA-256 hash of channel key>","connection_type":"master"}
+<- {"type":"channel_joined","channel":"<hash>","user_id":1,"user_ids":[],"clients":[],"e2e_available":true}
 <- {"type":"motd","motd":"Welcome","force_display":false}
 ```
 
@@ -456,8 +436,8 @@ E2E is never initiated on direct connections.
 
 ```
 -> {"type":"protocol_version","version":3}
--> {"type":"join","channel":"123456789","connection_type":"slave"}
-<- {"type":"channel_joined","channel":"123456789","user_id":2,"user_ids":[1],"clients":[{"id":1,"connection_type":"master","e2e_supported":true}],"e2e_available":true}
+-> {"type":"join","channel":"<SHA-256 hash of channel key>","connection_type":"slave"}
+<- {"type":"channel_joined","channel":"<hash>","user_id":2,"user_ids":[1],"clients":[{"id":1,"connection_type":"master","e2e_supported":true}],"e2e_available":true}
 ```
 
 **Client A receives notification:**
@@ -466,15 +446,15 @@ E2E is never initiated on direct connections.
 <- {"type":"client_joined","user_id":2,"client":{"id":2,"connection_type":"slave","e2e_supported":true}}
 ```
 
-**Signed key exchange:**
+**Ephemeral key exchange with HKDF channel-key binding:**
 
 ```
-A -> {"type":"e2e_pubkey","pubkey":"...","nonce_prefix":"...","identity_key":"...","signature":"..."}
+A -> {"type":"e2e_pubkey","pubkey":"...","nonce_prefix":"..."}
      (server relays to B with origin=1)
-     B verifies signature, TOFU checks identity_key, derives shared secret
-B -> {"type":"e2e_pubkey","pubkey":"...","nonce_prefix":"...","identity_key":"...","signature":"..."}
+     B performs X25519 DH, derives key via HKDF(dh_secret, channel_key, "nvda-remote-e2e")
+B -> {"type":"e2e_pubkey","pubkey":"...","nonce_prefix":"..."}
      (server relays to A with origin=2)
-     A verifies signature, TOFU checks identity_key, derives shared secret
+     A performs X25519 DH, derives key via HKDF(dh_secret, channel_key, "nvda-remote-e2e")
 ```
 
 **Encrypted key press (A -> B):**
