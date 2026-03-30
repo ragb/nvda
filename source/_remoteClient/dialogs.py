@@ -352,6 +352,16 @@ class DirectConnectDialog(ContextHelpMixin, wx.Dialog):
 		simpleBook.AddPage(self._clientPanel, "Client")
 		simpleBook.AddPage(self._serverPanel, "Server")
 		contentsSizerHelper.addItem(simpleBook)
+		self._enableE2E = contentsSizerHelper.addItem(
+			wx.CheckBox(
+				self,
+				# Translators: A checkbox in the Remote Access connection dialog to enable end-to-end encryption.
+				# When unchecked, the connection will not use E2E encryption, allowing connection to older
+				# NVDA versions or servers that do not support it.
+				label=pgettext("remote", "Use end-to-end &encryption"),
+			),
+		)
+		self._enableE2E.SetValue(True)
 		# Initialise persistence
 		self._registerAndRestorePersistentControls()
 		self._doSyncChoiceAndBook()
@@ -465,6 +475,7 @@ class DirectConnectDialog(ContextHelpMixin, wx.Dialog):
 			key=self._getKey(),
 			port=port,
 			insecure=insecure,
+			enableE2E=self._enableE2E.GetValue(),
 		)
 
 	def _onShow(self, evt: wx.ShowEvent):
@@ -532,35 +543,5 @@ class E2EUnavailableDialog(wx.MessageDialog):
 			_("Connect"),
 		)
 
-
-class E2EPeerUnsupportedDialog(wx.MessageDialog):
-	def __init__(self, parent: wx.Window | None):
-		# Translators: Title of the dialog presented when the remote computer does not support end-to-end encryption.
-		title = pgettext("remote", "Security Warning")
-		message = pgettext(
-			"remote",
-			# Translators: Message presented when E2E encryption is disabled because the other
-			# computer in the Remote Access session does not support it.
-			# This most likely means the other computer is running an older version of NVDA.
-			"The remote computer you are connected to does not support end-to-end encryption. "
-			"This usually means it is running an older version of NVDA.\n"
-			"\n"
-			"Without end-to-end encryption, your Remote Access session data is not protected "
-			"between your computer and the remote computer.\n"
-			"\n"
-			"Continue connecting anyway?",
-		)
-		super().__init__(
-			parent,
-			caption=title,
-			message=message,
-			style=wx.YES_NO | wx.NO_DEFAULT | wx.CENTRE,
-		)
-		self.SetYesNoLabels(
-			# Translators: A button to continue the Remote Access connection without end-to-end encryption.
-			_("Connect"),
-			# Translators: A button to disconnect the Remote Access connection because the remote computer does not support encryption.
-			_("Disconnect"),
-		)
 
 

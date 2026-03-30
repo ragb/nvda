@@ -171,20 +171,12 @@ class RemoteSession:
 		``address`` (tuple[str, int]) identifying the server.
 		This can be suppressed per-server.
 		"""
-		self.e2ePeerUnsupported: Action = Action()
-		"""Fired when E2E encryption is torn down because a connected peer
-		does not support it, most likely due to running an older NVDA version.
-		This cannot be suppressed as the peer set may change with each connection.
-		"""
 		self.e2eEstablished: Action = Action()
 		"""Notifies when E2E encryption is successfully established with at least one peer."""
-		self.e2eTornDown: Action = Action()
-		"""Notifies when an active E2E session is destroyed."""
 		# E2E encryption state
 		self.e2e: E2ESession | None = None
 		self._e2eAvailable: bool = False
 		self._myUserId: int | None = None
-		self._peerE2ESupport: dict[int, bool] = {}
 		self.transport.registerInbound(
 			RemoteMessageType.VERSION_MISMATCH,
 			self.handleVersionMismatch,
@@ -278,20 +270,13 @@ class RemoteSession:
 		"""Handle new client connection.
 
 		:param client: Dictionary containing client connection details
-		:note: Logs connection info and plays connection sound.
-			Also tracks E2E support and manages E2E session state.
+		:note: Logs connection info, plays connection sound, and sends
+			our E2E public key to E2E-capable peers.
 		"""
 		log.info(f"Client connected: {client!r}")
 		cues.clientConnected()
 		if client is not None:
-			self._peerE2ESupport[client["id"]] = client.get("e2e_supported", False)
-			if not client.get("e2e_supported", False) and self.e2e is not None:
-				# Non-E2E peer joined - tear down E2E
-				log.info("E2E: Session torn down, peer %d does not support encryption", client["id"])
-				self.e2e = None
-				self.e2eTornDown.notify()
-				self._warnE2EPeerUnsupported(client["id"])
-			elif client.get("e2e_supported", False) and self.e2e is not None:
+			if client.get("e2e_supported", False) and self.e2e is not None:
 				# E2E peer joined - send them our pubkey
 				self.transport.send(RemoteMessageType.E2E_PUBKEY, **self.e2e.get_pubkey_message())
 
@@ -304,7 +289,6 @@ class RemoteSession:
 		"""
 		cues.clientDisconnected()
 		if client is not None:
-			self._peerE2ESupport.pop(client.get("id"), None)
 			if self.e2e is not None:
 				self.e2e.remove_peer(client.get("id", 0))
 
@@ -319,37 +303,26 @@ class RemoteSession:
 		log.warning("E2E encryption unavailable: server does not support E2E")
 		self.e2eUnavailable.notify(address=self.transport.address)
 
-	def _warnE2EPeerUnsupported(self, peerId: int | None = None) -> None:
-		"""Warn that E2E was torn down because a peer does not support it.
-
-		Skips the warning for direct connections where E2E is not expected.
-		Notifies :attr:`e2ePeerUnsupported` so the client layer can prompt the user.
-		Unlike :meth:`_warnE2EUnavailable`, this cannot be suppressed per-server
-		as the peer set may change with each connection.
-		"""
-		if self._isDirectConnection:
-			return
-		if peerId is not None:
-			log.warning("E2E disabled: peer %d does not support encryption", peerId)
-		else:
-			log.warning("E2E disabled: not all peers support encryption")
-		self.e2ePeerUnsupported.notify()
-
 	def _tryInitE2E(self) -> None:
-		"""Init E2E if conditions are met: server allows it and all peers support it."""
+		"""Init E2E if conditions are met: user setting enabled and server allows it.
+
+		With channel key hashing, non-E2E clients cannot join the same channel
+		(they send the raw key, E2E clients send the hash), so there is no need
+		to check whether peers support E2E.
+		"""
+		if not self.transport.enableE2E:
+			log.info("E2E: Disabled by user setting")
+			self.e2e = None
+			self._warnE2EUnavailable()
+			return
 		if not self._e2eAvailable:
 			self.e2e = None
 			self._warnE2EUnavailable()
 			return
-		all_peers_e2e = all(self._peerE2ESupport.values()) if self._peerE2ESupport else True
-		if all_peers_e2e:
-			channelKey = getattr(self.transport, "channel", "") or ""
-			self.e2e = E2ESession(channelKey)
-			self.transport.send(RemoteMessageType.E2E_PUBKEY, **self.e2e.get_pubkey_message())
-			log.info("E2E: Session initialized, public key broadcast")
-		else:
-			self.e2e = None
-			self._warnE2EPeerUnsupported()
+		channelKey = getattr(self.transport, "channel", "") or ""
+		self.e2e = E2ESession(channelKey)
+		self.transport.send(RemoteMessageType.E2E_PUBKEY, **self.e2e.get_pubkey_message())
+		log.info("E2E: Session initialized, public key broadcast")
 
 	def _handleE2EPubkey(
 		self,
@@ -585,7 +558,6 @@ class FollowerSession(RemoteSession):
 		self._myUserId = user_id
 		self._e2eAvailable = e2e_available
 		for client in clients:
-			self._peerE2ESupport[client["id"]] = client.get("e2e_supported", False)
 			self.handleClientConnected(client)
 		self._tryInitE2E()
 
@@ -783,7 +755,6 @@ class LeaderSession(RemoteSession):
 		self._myUserId = user_id
 		self._e2eAvailable = e2e_available
 		for client in clients:
-			self._peerE2ESupport[client["id"]] = client.get("e2e_supported", False)
 			self.handleClientConnected(client)
 		self._tryInitE2E()
 

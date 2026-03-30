@@ -71,6 +71,13 @@ class ConnectionInfo:
 	insecure: bool = False
 	"""Allow insecure connections without SSL/TLS, defaults to False"""
 
+	enableE2E: bool = False
+	"""Enable end-to-end encryption for relay connections.
+
+	Defaults to False for backwards compatibility with existing saved connections.
+	New connections from the connect dialog default to True via the UI checkbox.
+	"""
+
 	def __post_init__(self) -> None:
 		self.port = self.port or SERVER_PORT
 		self.mode = ConnectionMode(self.mode)

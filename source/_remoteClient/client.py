@@ -396,7 +396,6 @@ class RemoteClient:
 			isDirectConnection=isDirectConnection,
 		)
 		self.leaderSession.e2eUnavailable.register(self.onE2EUnavailable)
-		self.leaderSession.e2ePeerUnsupported.register(self.onE2EPeerUnsupported)
 		transport.transportCertificateAuthenticationFailed.register(
 			self.onLeaderCertificateFailed,
 		)
@@ -451,7 +450,6 @@ class RemoteClient:
 			isDirectConnection=isDirectConnection,
 		)
 		self.followerSession.e2eUnavailable.register(self.onE2EUnavailable)
-		self.followerSession.e2ePeerUnsupported.register(self.onE2EPeerUnsupported)
 		if self.sdHandler is not None:
 			self.sdHandler.followerSession = self.followerSession
 		self.followerTransport = transport
@@ -543,17 +541,6 @@ class RemoteClient:
 		elif result == wx.ID_NO:
 			pass  # Continue this time, but ask again next time
 		else:
-			self.disconnect()
-
-	@alwaysCallAfter
-	def onE2EPeerUnsupported(self) -> None:
-		"""Handle E2E encryption torn down because a peer does not support it.
-
-		Always prompts — cannot be suppressed per-server since the peer set
-		may change with each connection.
-		"""
-		wnd = dialogs.E2EPeerUnsupportedDialog(gui.mainFrame)
-		if wnd.ShowModal() != wx.ID_YES:
 			self.disconnect()
 
 	def startControlServer(self, serverPort, channel):

@@ -609,6 +609,7 @@ class RelayTransport(TCPTransport):
 		connectionType: str | None = None,
 		protocolVersion: int = PROTOCOL_VERSION,
 		insecure: bool = False,
+		enableE2E: bool = True,
 	) -> None:
 		"""Initialize a new RelayTransport instance.
 
@@ -619,6 +620,7 @@ class RelayTransport(TCPTransport):
 		:param connectionType: Connection type identifier, defaults to ``None``
 		:param protocolVersion: Protocol version to use, defaults to :const:`PROTOCOL_VERSION`
 		:param insecure: Whether to skip certificate verification, defaults to ``False``
+		:param enableE2E: Whether to enable E2E encryption, defaults to ``True``
 		"""
 		super().__init__(
 			address=address,
@@ -629,6 +631,9 @@ class RelayTransport(TCPTransport):
 		log.info(f"Connecting to {address} channel {channel}")
 		self.channel: str | None = channel
 		"""Relay channel name"""
+
+		self.enableE2E: bool = enableE2E
+		"""Whether E2E encryption is enabled for this connection"""
 
 		self.connectionType: str | None = connectionType
 		""" Type of relay connection """
@@ -652,6 +657,7 @@ class RelayTransport(TCPTransport):
 			channel=connectionInfo.key,
 			connectionType=connectionInfo.mode,
 			insecure=connectionInfo.insecure,
+			enableE2E=connectionInfo.enableE2E,
 		)
 
 	def onConnected(self) -> None:
@@ -664,11 +670,15 @@ class RelayTransport(TCPTransport):
 		"""
 		self.send(RemoteMessageType.PROTOCOL_VERSION, version=self.protocolVersion)
 		if self.channel is not None:
-			from .e2e import hashChannelKey
+			if self.enableE2E:
+				from .e2e import hashChannelKey
 
+				channel = hashChannelKey(self.channel)
+			else:
+				channel = self.channel
 			self.send(
 				RemoteMessageType.JOIN,
-				channel=hashChannelKey(self.channel),
+				channel=channel,
 				connection_type=self.connectionType,
 			)
 		else:
